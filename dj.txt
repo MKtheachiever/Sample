@@ -1,0 +1,115 @@
+# Define constants
+$SUCCESS = 0
+$DomainJoinAttempts_MAX = 3
+
+# Initialize domain join attempts
+$DomainJoinAttempts = $env:DomainJoinAttempts
+if (-not $DomainJoinAttempts -or -not $DomainJoinAttempts -as [int]) {
+    $DomainJoinAttempts = 0
+}
+$DomainJoinAttempts++
+$env:DomainJoinAttempts = $DomainJoinAttempts
+
+# Function to check if the computer is a member of the specified domain
+function IsMemberOfDomain($sDomain) {
+    $computer = Get-WmiObject -Class Win32_ComputerSystem
+    foreach ($oComputer in $computer) {
+        switch ($oComputer.DomainRole) {
+            0, 2 { return $false }
+            1, 3, 4, 5 {
+                Write-Host "Check Win32_ComputerSystem.DomainRole = $($oComputer.DomainRole) For Domain: $($oComputer.Domain)"
+                return $oComputer.Domain -like "*$sDomain*"
+            }
+            default { Write-Host "Unknown value for Win32_ComputerSystem.DomainRole = $($oComputer.DomainRole)" }
+        }
+    }
+    Write-Host "Unknown Domain Status (Win32_ComputerSystem did not return any instances)."
+}
+
+# Main routine
+function Main {
+    # Main script processing
+
+    if ($env:JoinWorkgroup -ne "") {
+        Write-Host "Not attempting to join a domain because JoinWorkgroup = $($env:JoinWorkgroup)."
+    }
+    elseif ($env:JoinDomain -ne "") {
+        Write-Host "Verifying that the computer is joined to the requested domain."
+
+        if (IsMemberOfDomain $env:JoinDomain) {
+            Write-Host "The computer is already a member of a domain."
+        }
+        elseif ($DomainJoinAttempts -gt $DomainJoinAttempts_MAX) {
+            Write-Host "Consult file: c:\windows\debug\NetSetup.LOG for more debugging information."
+            Write-Host "ZTIDomainJoin has attempted to join to domain [$($env:JoinDomain)] too many times. Count = $DomainJoinAttempts"
+        }
+        else {
+            # Sync up to a Time Server to ensure that the domain join is successful.
+            if ($env:DomainJoinTimeSync -eq "") {
+                $env:DomainJoinTimeSync = "OnlySyncOnce"
+                if ($env:DeployRoot -like "*\*") {
+                    Invoke-Expression "net time $($(Split-Path $env:DeployRoot -Parent) /set /y)"
+                }
+            }
+
+            # Join a domain
+            if (($env:DomainErrorRecovery -eq "AUTO") -or ($env:DomainErrorRecovery -eq "")) {
+                Write-Host "DomainErrorRecovery Action: AutoRetry."
+
+                $computer = Get-WmiObject -Class Win32_ComputerSystem
+                foreach ($oComputer in $computer) {
+                    Write-Host "Initiating domain join operation using JoinDomainOrWorkgroup."
+                    $iRetVal = $oComputer.JoinDomainOrWorkgroup($env:JoinDomain, $env:DomainAdminPassword, "$($env:DomainAdminDomain)\$($env:DomainAdmin)", $env:MachineObjectOU, 3)
+                    Write-Host "Initial attempt: JoinDomain($($env:JoinDomain),PWD,$($env:DomainAdminDomain)\$($env:DomainAdmin),$($env:MachineObjectOU),3), rc = $($iRetVal)"
+
+                    if ($iRetVal -ne 0) {
+                        Write-Host "JoinDomain Failure: The account *may* already exist in a different OU. Retrying without the specified OU."
+                        $iRetVal = $oComputer.JoinDomainOrWorkgroup($env:JoinDomain, $env:DomainAdminPassword, "$($env:DomainAdminDomain)\$($env:DomainAdmin)", "", 1)
+                        Write-Host "Retry attempt: JoinDomain($($env:JoinDomain),PWD,$($env:DomainAdminDomain)\$($env:DomainAdmin),,3), rc = $($iRetVal)"
+                    }
+
+                    if ($iRetVal -eq 0) {
+                        Write-Host "JoinDomain Succeeded"
+                    }
+                    elseif ($iRetVal -eq 2691) {
+                        Write-Host "Machine is already a member of the domain (2)."
+                        return $SUCCESS
+                    }
+
+                    Write-Host "Initiating a reboot."
+                    $env:LTISuspend = ""
+                    $env:SMSTSRetryRequested = "true"
+                    $env:SMSTSRebootRequested = "true"
+                    return $SUCCESS
+                }
+            }
+            elseif ($env:DomainErrorRecovery -eq "MANUAL") {
+                Write-Host "DomainErrorRecovery Action: ManualRetry."
+                $sLTISuspend = ""
+                $iRetVal = (Test-Path "LTISuspend.wsf" -OutVariable sLTISuspend)
+                if ($iRetVal -eq $SUCCESS) {
+                    Invoke-Expression "cscript.exe //nologo ""$sLTISuspend"""
+                }
+
+                $env:LTISuspend = "The machine was not joined to the requested domain [$($env:JoinDomain)]. Please manually join to this domain."
+                $env:SMSTSRebootRequested = "true"
+                $env:SMSTSRetryRequested = "true"
+                return $SUCCESS
+            }
+            elseif ($env:DomainErrorRecovery -eq "FAIL") {
+                Write-Host "DomainErrorRecovery Action: FailNoRetry."
+                Write-Host "Unable to Join Domain $($env:JoinDomain) Stop installation."
+                return 10201
+            }
+            else {
+                Write-Host "Unknown DomainErrorRecovery Action: $($env:DomainErrorRecovery)"
+            }
+        }
+    }
+    else {
+        Write-Host "Neither JoinDomain or JoinWorkgroup is defined."
+    }
+}
+
+# Call the Main function
+Main
